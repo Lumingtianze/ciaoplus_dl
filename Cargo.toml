@@ -1,0 +1,72 @@
+[package]
+name = "ciaoplus_dl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 核心异步运行时
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
+# 强大的异步流处理
+tokio-stream = "0.1"
+futures = "0.3"
+
+# 网络请求客户端
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+
+# 序列化/反序列化 (JSON, TOML)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+
+# 简洁的错误处理
+anyhow = "1.0"
+
+# 图像处理
+image = { version = "0.25", features = ["webp", "jpeg", "avif"] }
+mozjpeg = "0.10"
+
+# SHA256 哈希计算
+sha2 = "0.10"
+
+# 时间和时区处理
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# HTML 解析
+scraper = "0.24"
+
+# 正则表达式库
+regex = "1.10"
+
+url = "2.5"
+
+urlencoding = "2.1.3"
+
+# 命令行参数解析
+clap = { version = "4.4", features = ["derive"] }
+
+# OSS/S3 支持 (可选功能)
+aws-config = { version = "1.5", optional = true }
+aws-sdk-s3 = { version = "1.23", optional = true }
+
+
+# 守护进程功能 (仅限 Unix)
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5"
+
+[features]
+default = []
+# 编译时开关，用于启用 S3/OSS 功能
+oss = ["dep:aws-config", "dep:aws-sdk-s3"]
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+[[bin]]
+name = "ciao"
+path = "src/main.rs"
