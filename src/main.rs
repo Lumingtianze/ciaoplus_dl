@@ -17,7 +17,7 @@ use reqwest::header::{self, HeaderMap};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +25,7 @@ use tokio::fs;
 use tokio::sync::Mutex;
 use tokio_stream;
 
-// --- 命令行和配置结构  ---
+// --- 命令行和配置结构 ---
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
@@ -151,7 +151,7 @@ impl StorageClient {
                 Ok(())
             }
             #[cfg(feature = "oss")]
-            StorageConfig::S3 {
+            StorageClient::S3 {
                 client,
                 bucket,
                 base_path,
@@ -247,6 +247,8 @@ struct EpisodeInfo {
 struct EpisodeViewerResponse {
     page_list: Vec<String>,
     scramble_seed: u32,
+    // 更新: 添加 scramble_ver 字段
+    scramble_ver: Option<u32>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -267,7 +269,7 @@ struct TagInfo {
     tag_name: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 struct DownloadLog {
     series_id: u32,
     series_title: String,
@@ -304,9 +306,21 @@ fn seeded_shuffle(indices: &mut Vec<usize>, seed: u32) {
     *indices = pairs.into_iter().map(|(_, val)| val).collect();
 }
 
-fn restore_image(scrambled_data: &[u8], seed: u32) -> Result<RgbaImage> {
+// 更新: 这是图像还原逻辑的核心调度器
+// 它接收加扰版本号 `scramble_ver`，并根据其值选择调用 V1 或 V2 的实现
+fn restore_image(scrambled_data: &[u8], seed: u32, ver: u32) -> Result<RgbaImage> {
     let scrambled_img =
         image::load_from_memory_with_format(scrambled_data, ImageFormat::Jpeg)?.to_rgba8();
+
+    match ver {
+        2 => restore_image_v2(&scrambled_img, seed),
+        _ => restore_image_v1(&scrambled_img, seed),
+    }
+}
+
+// 这是原始的、用于 scramble_ver: 1 的图像还原逻辑
+// 计算方式为：有效尺寸 = (总尺寸 / 8) * 8，图块尺寸 = 有效尺寸 / 4
+fn restore_image_v1(scrambled_img: &RgbaImage, seed: u32) -> Result<RgbaImage> {
     let (width, height) = scrambled_img.dimensions();
 
     const GRID_DIMENSION: u32 = 4;
@@ -315,15 +329,68 @@ fn restore_image(scrambled_data: &[u8], seed: u32) -> Result<RgbaImage> {
     let effective_width = (width / ALIGNMENT_VALUE) * ALIGNMENT_VALUE;
     let effective_height = (height / ALIGNMENT_VALUE) * ALIGNMENT_VALUE;
 
-    if effective_width == 0 || effective_height == 0 {
-        bail!("计算出的有效尺寸为零，无法还原图片。");
+    if effective_width < GRID_DIMENSION || effective_height < GRID_DIMENSION {
+        bail!("V1: 计算出的有效尺寸过小，无法还原图片。");
     }
 
     let tile_width = effective_width / GRID_DIMENSION;
     let tile_height = effective_height / GRID_DIMENSION;
 
+    // 先覆盖基础图像，再根据种子重排图块
     let mut restored_image = RgbaImage::new(width, height);
-    imageops::overlay(&mut restored_image, &scrambled_img, 0, 0);
+    imageops::overlay(&mut restored_image, scrambled_img, 0, 0);
+
+    let num_cells = (GRID_DIMENSION * GRID_DIMENSION) as usize;
+    let mut indices: Vec<usize> = (0..num_cells).collect();
+    seeded_shuffle(&mut indices, seed);
+
+    for (dest_index, &source_index) in indices.iter().enumerate() {
+        let source_col = source_index as u32 % GRID_DIMENSION;
+        let source_row = source_index as u32 / GRID_DIMENSION;
+        let dest_col = dest_index as u32 % GRID_DIMENSION;
+        let dest_row = dest_index as u32 / GRID_DIMENSION;
+
+        let src_x = source_col * tile_width;
+        let src_y = source_row * tile_height;
+        let dest_x = dest_col * tile_width;
+        let dest_y = dest_row * tile_height;
+
+        let block_view = scrambled_img.view(src_x, src_y, tile_width, tile_height);
+        imageops::replace(
+            &mut restored_image,
+            &block_view.to_image(),
+            dest_x.into(),
+            dest_y.into(),
+        );
+    }
+
+    Ok(restored_image)
+}
+
+// 更新: 这是新增的、用于 scramble_ver: 2 的图像还原逻辑
+// 计算方式为：图块尺寸 = ((总尺寸 / 8) / 4) * 8
+fn restore_image_v2(scrambled_img: &RgbaImage, seed: u32) -> Result<RgbaImage> {
+    let (width, height) = scrambled_img.dimensions();
+
+    const GRID_DIMENSION: u32 = 4;
+    const ALIGNMENT_VALUE: u32 = 8;
+
+    if width < GRID_DIMENSION * ALIGNMENT_VALUE || height < GRID_DIMENSION * ALIGNMENT_VALUE {
+        bail!("V2: 图像尺寸过小，无法进行还原。");
+    }
+
+    let temp_width = width / ALIGNMENT_VALUE;
+    let temp_height = height / ALIGNMENT_VALUE;
+
+    let tile_width = (temp_width / GRID_DIMENSION) * ALIGNMENT_VALUE;
+    let tile_height = (temp_height / GRID_DIMENSION) * ALIGNMENT_VALUE;
+
+    if tile_width == 0 || tile_height == 0 {
+        bail!("V2: 计算出的图块尺寸为零，无法还原。");
+    }
+
+    let mut restored_image = RgbaImage::new(width, height);
+    imageops::overlay(&mut restored_image, scrambled_img, 0, 0);
 
     let num_cells = (GRID_DIMENSION * GRID_DIMENSION) as usize;
     let mut indices: Vec<usize> = (0..num_cells).collect();
@@ -387,7 +454,7 @@ fn encode_image(
         ImageFormatType::Avif => {
             let mut buffer = std::io::Cursor::new(Vec::new());
             let quality = quality_opt.unwrap_or(80).max(0).min(100);
-            let speed = 8;
+            let speed = 7;
             img.write_with_encoder(AvifEncoder::new_with_speed_quality(
                 &mut buffer,
                 speed,
@@ -453,6 +520,9 @@ async fn download_episode(
         return Ok(true);
     }
 
+    // 如果 API 未返回 scramble_ver，则默认为 1，确保向后兼容
+    let scramble_ver = episode_data.scramble_ver.unwrap_or(1);
+
     let successful_saves = Arc::new(Mutex::new(0));
     let errors = Arc::new(Mutex::new(Vec::new()));
 
@@ -466,6 +536,7 @@ async fn download_episode(
             let semaphore = Arc::clone(&semaphore);
             let storage = &*storage;
             let scramble_seed = episode_data.scramble_seed;
+            let scramble_ver = scramble_ver;
 
             async move {
                 let task = async {
@@ -475,7 +546,8 @@ async fn download_episode(
 
                     let (img_bytes, extension) =
                         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, &'static str)> {
-                            let final_image = restore_image(&scrambled_bytes, scramble_seed)?;
+                            // 将版本号传递给还原函数，由它来决定使用哪种算法
+                            let final_image = restore_image(&scrambled_bytes, scramble_seed, scramble_ver)?;
                             encode_image(&final_image, image_output_config.as_ref())
                         })
                         .await??;
@@ -566,15 +638,26 @@ async fn run_tasks(
         }
 
         for series_info in search_response.title_list {
-            let manga_key = PathBuf::from(format!(
-                "{} [{}]",
-                sanitize_filename(&series_info.title_name),
-                &series_info.title_id
-            ));
+            // 保持漫画文件夹命名不变，只使用清理后的标题
+            let manga_key = PathBuf::from(sanitize_filename(&series_info.title_name));
+
             println!(
                 ">>> 处理系列: '{}' (ID: {})",
                 series_info.title_name, series_info.title_id
             );
+
+            // 在处理任何章节之前，先读取一次日志文件，用于后续的有状态冲突检测
+            let log_key = manga_key.join("download_log.json");
+            let log_data = storage.read_to_vec(&log_key).await?;
+            let log_instance: DownloadLog = if let Some(data) = log_data {
+                serde_json::from_slice(&data).unwrap_or_default()
+            } else {
+                DownloadLog {
+                    series_id: series_info.title_id,
+                    series_title: series_info.title_name.clone(),
+                    chapters: HashMap::new(),
+                }
+            };
 
             let episode_ids_str = series_info
                 .episode_id_list
@@ -616,6 +699,46 @@ async fn run_tasks(
                 continue;
             }
             println!("[信息] 找到 {} 个免费章节。", free_episodes.len());
+
+            // 更新: 实现有状态的冲突检测，通过结合当前API返回的章节和日志中记录的历史章节，全面地识别重名情况
+            let mut conflicting_names: HashSet<String> = HashSet::new();
+
+            // 1. 检测当前API返回的列表中是否存在重名
+            let mut current_name_counts = HashMap::new();
+            for episode in &free_episodes {
+                *current_name_counts.entry(sanitize_filename(&episode.episode_name)).or_insert(0) += 1;
+            }
+            for (name, count) in current_name_counts {
+                if count > 1 {
+                    conflicting_names.insert(name);
+                }
+            }
+
+            // 2. 检测新章节（未记录在日志中）是否与历史章节重名
+            let historical_titles: HashSet<String> = log_instance
+                .chapters
+                .values()
+                .map(|log| sanitize_filename(&log.title))
+                .collect();
+
+            for episode in &free_episodes {
+                let episode_id_str = episode.episode_id.to_string();
+                // 如果一个章节的ID不在我们的下载记录中，但它的标题存在于历史标题集合里，
+                // 那么它就是一个与历史章节重名的新章节，需要标记
+                if !log_instance.chapters.contains_key(&episode_id_str) {
+                    let sanitized_name = sanitize_filename(&episode.episode_name);
+                    if historical_titles.contains(&sanitized_name) {
+                        conflicting_names.insert(sanitized_name);
+                    }
+                }
+            }
+            
+            // 将最终结果转换为 Arc<HashSet> 以便在异步任务中共享
+            let conflicting_names_arc = Arc::new(conflicting_names);
+
+            if !conflicting_names_arc.is_empty() {
+                println!("[注意] 检测到以下章节存在重名(包括历史记录)，将为其文件夹附加ID: {:?}", conflicting_names_arc);
+            }
 
             let info_key = manga_key.join("info.json");
             if storage.read_to_vec(&info_key).await?.is_none() {
@@ -670,17 +793,8 @@ async fn run_tasks(
                 }
             }
 
-            let log_key = manga_key.join("download_log.json");
-            let log_data = storage.read_to_vec(&log_key).await?;
-            let log = Arc::new(Mutex::new(if let Some(data) = log_data {
-                serde_json::from_slice(&data).unwrap_or_default()
-            } else {
-                DownloadLog {
-                    series_id: series_info.title_id,
-                    series_title: series_info.title_name.clone(),
-                    chapters: HashMap::new(),
-                }
-            }));
+            // 将从文件中读取的 log_instance 移动到 Arc<Mutex> 中，用于后续的并发读写
+            let log = Arc::new(Mutex::new(log_instance));
 
             let chapter_tasks: Vec<_> = free_episodes
                 .into_iter()
@@ -691,9 +805,11 @@ async fn run_tasks(
                     let log = Arc::clone(&log);
                     let download_semaphore = Arc::clone(&download_semaphore);
                     let image_output_config = config.image_output;
+                    let conflicting_names = Arc::clone(&conflicting_names_arc);
 
                     async move {
                         let episode_id_str = episode.episode_id.to_string();
+                        // 检查日志，如果已完成则跳过
                         if let Some(chapter_log) = log.lock().await.chapters.get(&episode_id_str) {
                             if chapter_log.completed {
                                 println!("[跳过] '{}'", episode.episode_name);
@@ -702,8 +818,16 @@ async fn run_tasks(
                         }
 
                         println!("[任务] 开始处理 '{}'", episode.episode_name);
-                        let episode_base_key =
-                            manga_key.join(sanitize_filename(&episode.episode_name));
+
+                        // 更新: 动态生成章节文件夹名称
+                        // 如果章节名在冲突集合中，则附加ID，否则只使用章节名
+                        let sanitized_name = sanitize_filename(&episode.episode_name);
+                        let chapter_folder_name = if conflicting_names.contains(&sanitized_name) {
+                            format!("{} [{}]", sanitized_name, episode.episode_id)
+                        } else {
+                            sanitized_name
+                        };
+                        let episode_base_key = manga_key.join(chapter_folder_name);
 
                         match download_episode(
                             &storage,
@@ -717,6 +841,7 @@ async fn run_tasks(
                         .await
                         {
                             Ok(true) => {
+                                // 如果下载成功，则在内存中的日志对象里记录该章节
                                 let mut lg = log.lock().await;
                                 lg.chapters.insert(
                                     episode_id_str,
@@ -744,6 +869,7 @@ async fn run_tasks(
                 .for_each_concurrent(task_limit, |task| task)
                 .await;
 
+            // 在处理完一个系列的所有章节后，将内存中完整的日志对象写回文件
             println!(
                 "[日志] 正在将下载记录写回存储 (ID: {})...",
                 series_info.title_id
